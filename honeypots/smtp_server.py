@@ -30,6 +30,8 @@ class QSMTPServer(BaseServer):
                 finally:
                     if fun:
                         socket.getfqdn = fun
+                self.auth_phase = ""
+                self.auth_login_user = ""
 
             def connectionMade(self):  # noqa: N802
                 _q_s.log(
@@ -45,6 +47,22 @@ class QSMTPServer(BaseServer):
                 command, *rest = line.split(b" ")
                 arg = rest[0] if rest else None
                 data = rest[1] if len(rest) > 1 else None
+                if self.auth_phase == "PLAIN":
+                    if not self.check_credentials(command):
+                        self.sendCode(535, b'5.7.8 Error: authentication failed: authentication failure')
+                    self.auth_phase = ""
+                    return
+                if self.auth_phase == "LOGIN-USER":
+                    self.auth_login_user = command
+                    self.sendCode(334, b"UGFzc3dvcmQ6")
+                    self.auth_phase = "LOGIN-PASS"
+                    return
+                if self.auth_phase == "LOGIN-PASS":
+                    if not self.check_credentials_login(command):
+                        self.sendCode(535, b'5.7.8 Error: authentication failed: authentication failure')
+                    self.auth_phase = ""
+                    self.auth_login_user = ""
+                    return
                 if command.upper() not in {b"HELO", b"EHLO"}:
                     _q_s.log(
                         {
@@ -59,15 +77,49 @@ class QSMTPServer(BaseServer):
             def do_EHLO(self, arg):
                 self.sendCode(250, f"ip-127-0-0-1.ec2.internal Hello {arg}\n8BITMIME\nAUTH LOGIN PLAIN\nSTARTTLS".encode())
 
-            def ext_AUTH(self, arg):
-                if arg.startswith(b"PLAIN "):
+            def check_credentials(self, arg):
+                try:
                     _, username, password = (
-                        b64decode(arg.split(b" ")[1].strip())
+                        b64decode(arg.strip())
                         .decode("utf-8", errors="replace")
                         .split("\0")
                     )
-                    _q_s.check_login(username, password, self.transport.getPeer().host, self.transport.getPeer().port)
-                self.sendCode(235,b'Authentication successful.')
+                except:
+                    return False
+                if _q_s.check_login(username, password, self.transport.getPeer().host, self.transport.getPeer().port):
+                    self.sendCode(235, b'Authentication successful.')
+                    return True
+
+            def check_credentials_login(self, arg):
+                try:
+                    username = (
+                        b64decode(self.auth_login_user.strip())
+                        .decode("utf-8", errors="replace")
+                    )
+                    password = (
+                        b64decode(arg.strip())
+                        .decode("utf-8", errors="replace")
+                    )
+                except:
+                    return False
+                if _q_s.check_login(username, password, self.transport.getPeer().host, self.transport.getPeer().port):
+                    self.sendCode(235, b'Authentication successful.')
+                    return True
+
+            def ext_AUTH(self, arg):
+                if arg.startswith(b"PLAIN "):
+                    data = arg.split(b" ")[1]
+                    if self.check_credentials(data):
+                        return
+                if arg == b"PLAIN":
+                    self.sendCode(334, b"")
+                    self.auth_phase = "PLAIN"
+                    return
+                if arg == b"LOGIN":
+                    self.sendCode(334, b"VXNlcm5hbWU6")
+                    self.auth_phase = "LOGIN-USER"
+                    return
+                self.sendCode(535, b'5.7.8 Error: authentication failed: authentication failure')
 
         class CustomSMTPFactory(Factory):
             protocol = CustomSMTPProtocol
